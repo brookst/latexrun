@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
+from __future__ import print_function
 import sys
 import os
 import errno
@@ -165,7 +166,8 @@ def main():
         task_commit = LaTeXCommit(db, task_latex, args.output)
         task_bibtex = BibTeX(db, task_latex, args.bibtex_cmd, args.bibtex_args,
                              args.nowarns, args.obj_dir)
-        tasks = [task_latex, task_commit, task_bibtex]
+        task_glossary = Glossary(db, task_latex, args.obj_dir)
+        tasks = [task_latex, task_commit, task_bibtex, task_glossary]
         stable = run_tasks(tasks, args.max_iterations)
 
         # Print final task output and gather exit status
@@ -1011,10 +1013,10 @@ class LaTeXCommit(Task):
                          normalize_input_path(latex_task.get_tex_filename()))
         self.__latex_task = latex_task
         self.__output_path = output_path
-        self.status = 'There were errors'
+        self.status = None
 
     def _input_latex(self):
-        return self.__latex_task.get_status(), self.__latex_task.get_outname()
+        return [self.__latex_task.get_status(), self.__latex_task.get_outname()]
 
     def _execute(self):
         self.status = 'There were errors'
@@ -1931,6 +1933,107 @@ class Kpathsea:
         if cwd is None:
             return path
         return os.path.join(cwd, path)
+
+##################################################################
+# Glossary task
+#
+
+class Glossary(Task):
+    def __init__(self, db, latex_task, obj_dir):
+        super().__init__(db, 'glossary::' + normalize_input_path(
+            latex_task.get_tex_filename()))
+        self.__latex_task = latex_task
+        self.__obj_dir = obj_dir
+        self.__cmd = 'makeglossaries'
+        self.__cmd_args = ['-d', 'latex.out']
+
+    def stable(self):
+        return super().stable()
+
+    def _input_args(self):
+        basename = os.path.basename(self.__latex_task.get_jobname())
+        return [self.__cmd] + self.__cmd_args + [basename]
+
+    def _input_cwd(self):
+        return os.path.dirname(self.__latex_task.get_jobname())
+
+    def __feed_terminal(self, stdout):
+        with Progress('glossary') as progress:
+            buf, linebuf = [], ''
+            while True:
+                data = os.read(stdout.fileno(), 4096)
+                if not data:
+                    break
+                # See "A note about encoding" above
+                data = data.decode('ascii', errors='surrogateescape')
+                buf.append(data)
+                linebuf += data
+                while '\n' in linebuf:
+                    line, _, linebuf = linebuf.partition('\n')
+                    debug(line)
+                    if line.startswith('Scanning '):
+                        filename = re.sub(r'^Scanning .* file (.*[^\.])\.*done .*$', r'\1', line)
+                        progress.update(self.__preppend_cwd(filename))
+        return ''.join(buf)
+
+    def __parse_filenames(self, stdout):
+        styname = inname = outname = None
+
+        for m in re.finditer(r'^Scanning style file "?([^\n]*\.[^ ."]+)"?\.',
+                             stdout, re.MULTILINE | re.DOTALL):
+            styname = self.__preppend_cwd(m.group(1).replace('\n', ''))
+        if styname is None:
+            print(stdout, file=sys.stderr)
+            raise TaskError('failed to extract style name from glossary output')
+
+        for m in re.finditer(r'^Scanning input file "?([^\n]*\.[^ ."]+)"?\.',
+                             stdout, re.MULTILINE | re.DOTALL):
+            inname = self.__preppend_cwd(m.group(1).replace('\n', ''))
+        if inname is None:
+            print(stdout, file=sys.stderr)
+            raise TaskError('failed to extract input name from glossary output')
+
+        for m in re.finditer(r'^Output written in "?([^\n]*\.[^ ."\n]+)"?\.$',
+                             stdout, re.MULTILINE | re.DOTALL):
+            outname = self.__preppend_cwd(m.group(1).replace('\n', ''))
+        if outname is None:
+            print(stdout, file=sys.stderr)
+            raise TaskError('failed to extract output name from glossary output')
+
+        # makeglossaries doesn't include the output directory in the
+        # logged transcript or output file name.
+
+        return styname, inname, outname
+
+    def __preppend_cwd(self, filepath):
+        if filepath.startswith('./'):
+            filepath = filepath[2:]
+        if os.path.basename(filepath) == filepath and \
+                os.path.exists(os.path.join(self.__obj_dir, filepath)):
+            filepath = os.path.join(self.__obj_dir, filepath)
+        return filepath
+
+    def _execute(self):
+        self._input('unknown_input')
+        args = self._input('args')
+        debug('running {}', args)
+
+        try:
+            verbose_cmd(args)
+            p = subprocess.Popen(args, # cwd=cwd, env=env,
+                                 stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT)
+            stdout = self.__feed_terminal(p.stdout)
+            status = p.wait()
+        except OSError as e:
+            raise TaskError('failed to execute glossary task: ' + str(e)) from e
+
+        styname, inname, outname = self.__parse_filenames(stdout)
+
+        inputs = [inname, styname]
+        outputs = [outname]
+        return RunResult(outputs, {'status': status, 'inputs': inputs})
 
 if __name__ == "__main__":
     main()
