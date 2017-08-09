@@ -1013,7 +1013,7 @@ class LaTeXCommit(Task):
                          normalize_input_path(latex_task.get_tex_filename()))
         self.__latex_task = latex_task
         self.__output_path = output_path
-        self.status = None
+        self.status = 'There were errors'
 
     def _input_latex(self):
         return [self.__latex_task.get_status(), self.__latex_task.get_outname()]
@@ -1945,10 +1945,53 @@ class Glossary(Task):
         self.__latex_task = latex_task
         self.__obj_dir = obj_dir
         self.__cmd = 'makeglossaries'
-        self.__cmd_args = ['-d', 'latex.out']
+        self.__cmd_args = ['-d', obj_dir]
 
     def stable(self):
+        # If makeglossaries doesn't have its inputs, then it's stable because
+        # it has no effect on system state.
+        jobname = self.__latex_task.get_jobname()
+        if jobname is None:
+            # We don't know where the .aux file is until latex has run
+            return True
+        if not os.path.exists(jobname + '.aux'):
+            # Input isn't ready, so makeglossaries will simply fail
+            # without affecting system state. Hence, this task is
+            # trivially stable.
+            return True
+        if not self.__find_gls_cmds(os.path.dirname(jobname), jobname + '.aux'):
+            # The tex file doesn't refer to any bibliographic data, so
+            # don't run bibtex.
+            return True
+
         return super().stable()
+
+    def __find_gls_cmds(self, basedir, auxname, stack=()):
+        debug('scanning for gls commands in {}'.format(auxname))
+        if auxname in stack:
+            raise TaskError('.aux file loop')
+        stack = stack + (auxname,)
+
+        try:
+            aux_data = open(auxname, errors='surrogateescape').read()
+        except FileNotFoundError:
+            # The aux file may not exist if latex aborted
+            debug("Could not read aux file - no gls files")
+            return False
+        if re.search(r'^\\\@newglossary\{', aux_data, flags=re.M) or \
+           re.search(r'^\\\@istfilename\{',  aux_data, flags=re.M):
+            debug("Found gls term")
+            return True
+
+        # Recurse into included aux files (see aux_input_command), in
+        # case \bibliography appears in an \included file.
+        for m in re.finditer(r'^\\@input\{([^}]*)\}', aux_data, flags=re.M):
+            if self.__find_gls_cmds(basedir, os.path.join(basedir, m.group(1)),
+                                    stack):
+                return True
+
+        debug("No gls terms found")
+        return False
 
     def _input_args(self):
         basename = os.path.basename(self.__latex_task.get_jobname())
