@@ -26,7 +26,8 @@ def main():
     os.makedirs('output', exist_ok=True)
 
     for inp in args.input:
-        test(args.latexrun, latexrun_args, inp)
+        # Copy latexrun_args to avoid modification
+        test(args.latexrun, list(latexrun_args), inp)
 
     sys.exit(1 if failures else 0)
 
