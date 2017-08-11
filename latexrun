@@ -2022,12 +2022,17 @@ class Glossary(Task):
     def __parse_filenames(self, stdout):
         styname = inname = outname = None
 
+        # makeglossaries doesn't include the output directory in the
+        # logged transcript or output file name - hence __preppend_cwd()
+
+        for m in re.finditer(r'^xindy.*-o "([^"]+)"', stdout, re.MULTILINE | re.DOTALL):
+            outname = self.__preppend_cwd(m.group(1).replace('\n', ''))
+        for m in re.finditer(r'^xindy.* "([^"]+)"$', stdout, re.MULTILINE | re.DOTALL):
+            inname = self.__preppend_cwd(m.group(1).replace('\n', ''))
+
         for m in re.finditer(r'^Scanning style file "?([^\n]*\.[^ ."]+)"?\.',
                              stdout, re.MULTILINE | re.DOTALL):
             styname = self.__preppend_cwd(m.group(1).replace('\n', ''))
-        if styname is None:
-            print(stdout, file=sys.stderr)
-            raise TaskError('failed to extract style name from glossary output')
 
         for m in re.finditer(r'^Scanning input file "?([^\n]*\.[^ ."]+)"?\.',
                              stdout, re.MULTILINE | re.DOTALL):
@@ -2042,9 +2047,6 @@ class Glossary(Task):
         if outname is None:
             print(stdout, file=sys.stderr)
             raise TaskError('failed to extract output name from glossary output')
-
-        # makeglossaries doesn't include the output directory in the
-        # logged transcript or output file name.
 
         return styname, inname, outname
 
@@ -2074,7 +2076,9 @@ class Glossary(Task):
 
         styname, inname, outname = self.__parse_filenames(stdout)
 
-        inputs = [inname, styname]
+        inputs = [inname]
+        if styname:
+            inputs.append(styname)
         outputs = [outname]
         return RunResult(outputs, {'status': status, 'inputs': inputs})
 
