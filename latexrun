@@ -2038,14 +2038,12 @@ class Glossary(Task):
                              stdout, re.MULTILINE | re.DOTALL):
             inname = self.__preppend_cwd(m.group(1).replace('\n', ''))
         if inname is None:
-            print(stdout, file=sys.stderr)
             raise TaskError('failed to extract input name from glossary output')
 
         for m in re.finditer(r'^Output written in "?([^\n]*\.[^ ."\n]+)"?\.$',
                              stdout, re.MULTILINE | re.DOTALL):
             outname = self.__preppend_cwd(m.group(1).replace('\n', ''))
         if outname is None:
-            print(stdout, file=sys.stderr)
             raise TaskError('failed to extract output name from glossary output')
 
         return styname, inname, outname
@@ -2059,7 +2057,6 @@ class Glossary(Task):
         return filepath
 
     def _execute(self):
-        self._input('unknown_input')
         args = self._input('args')
         debug('running {}', args)
 
