@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
+from __future__ import print_function
 import sys
 import os
 import errno
@@ -36,6 +37,12 @@ import filecmp
 import io
 import traceback
 import time
+
+try:
+    import fcntl
+except ImportError:
+    # Non-UNIX platform
+    fcntl = None
 
 def debug(string, *args):
     if debug.enabled:
@@ -158,8 +165,9 @@ def main():
                            args.obj_dir, args.nowarns)
         task_commit = LaTeXCommit(db, task_latex, args.output)
         task_bibtex = BibTeX(db, task_latex, args.bibtex_cmd, args.bibtex_args,
-                             args.nowarns)
-        tasks = [task_latex, task_commit, task_bibtex]
+                             args.nowarns, args.obj_dir)
+        task_glossary = Glossary(db, task_latex, args.obj_dir)
+        tasks = [task_latex, task_commit, task_bibtex, task_glossary]
         stable = run_tasks(tasks, args.max_iterations)
 
         # Print final task output and gather exit status
@@ -253,6 +261,19 @@ class DB:
     def __init__(self, filename):
         self.__filename = filename
 
+        # Make sure database directory exists
+        if os.path.dirname(self.__filename):
+            os.makedirs(os.path.dirname(self.__filename), exist_ok=True)
+
+        # Lock the database if possible. We don't release this lock
+        # until the process exits.
+        lockpath = self.__filename + '.lock'
+        if fcntl is not None:
+            lockfd = os.open(lockpath, os.O_CREAT|os.O_WRONLY|os.O_CLOEXEC, 0o666)
+            # Note that this is actually an fcntl lock, not a lockf
+            # lock. Don't be fooled.
+            fcntl.lockf(lockfd, fcntl.LOCK_EX, 1)
+
         try:
             fp = open(filename, 'r')
         except FileNotFoundError:
@@ -269,9 +290,6 @@ class DB:
 
     def commit(self):
         debug('committing database')
-        # Make sure database directory exists
-        if os.path.dirname(self.__filename):
-            os.makedirs(os.path.dirname(self.__filename), exist_ok=True)
         # Atomically commit database
         tmp_filename = self.__filename + '.tmp'
         with open(tmp_filename, 'w') as fp:
@@ -1013,7 +1031,7 @@ class LaTeXCommit(Task):
         self.status = 'There were errors'
 
     def _input_latex(self):
-        return self.__latex_task.get_status(), self.__latex_task.get_outname()
+        return [self.__latex_task.get_status(), self.__latex_task.get_outname()]
 
     def _execute(self):
         self.status = 'There were errors'
@@ -1488,12 +1506,13 @@ class LaTeXFilter:
 #
 
 class BibTeX(Task):
-    def __init__(self, db, latex_task, cmd, cmd_args, nowarns):
+    def __init__(self, db, latex_task, cmd, cmd_args, nowarns, obj_dir):
         super().__init__(db, 'bibtex::' + normalize_input_path(
             latex_task.get_tex_filename()))
         self.__latex_task = latex_task
         self.__cmd = cmd
         self.__cmd_args = cmd_args
+        self.__obj_dir = obj_dir
 
     def stable(self):
         # If bibtex doesn't have its inputs, then it's stable because
@@ -1529,6 +1548,10 @@ class BibTeX(Task):
            re.search(r'^\\bibdata\{',  aux_data, flags=re.M):
             return True
 
+        if re.search(r'^\\abx@aux@cite\{', aux_data, flags=re.M):
+            # biber citation
+            return True
+
         # Recurse into included aux files (see aux_input_command), in
         # case \bibliography appears in an \included file.
         for m in re.finditer(r'^\\@input\{([^}]*)\}', aux_data, flags=re.M):
@@ -1539,7 +1562,10 @@ class BibTeX(Task):
         return False
 
     def _input_args(self):
-        aux_name = os.path.basename(self.__latex_task.get_jobname()) + '.aux'
+        if self.__is_biber():
+            aux_name = os.path.basename(self.__latex_task.get_jobname())
+        else:
+            aux_name = os.path.basename(self.__latex_task.get_jobname()) + '.aux'
         return [self.__cmd] + self.__cmd_args + [aux_name]
 
     def _input_cwd(self):
@@ -1556,7 +1582,8 @@ class BibTeX(Task):
                 h = hashlib.sha256()
                 for line in aux:
                     if line.startswith((b'\\citation{', b'\\bibdata{',
-                                        b'\\bibstyle{', b'\\@input{')):
+                                        b'\\bibstyle{', b'\\@input{',
+                                        b'\\abx@aux@cite{')):
                         h.update(line)
                 return h.hexdigest()
         except FileNotFoundError:
@@ -1568,6 +1595,9 @@ class BibTeX(Task):
             # Append ':' to keep the default search path
             return first + ':'
         return first + ':' + rest
+
+    def __is_biber(self):
+        return "biber" in self.__cmd
 
     def _execute(self):
         # This gets complicated when \include is involved.  \include
@@ -1600,7 +1630,7 @@ class BibTeX(Task):
         except OSError as e:
             raise TaskError('failed to execute bibtex task: ' + str(e)) from e
 
-        inputs, auxnames = self.__parse_inputs(stdout, cwd, env)
+        inputs, auxnames, outbase = self.__parse_inputs(stdout, cwd, env)
         if not inputs and not auxnames:
             # BibTeX failed catastrophically.
             print(stdout, file=sys.stderr)
@@ -1616,7 +1646,8 @@ class BibTeX(Task):
         for path in inputs:
             self._input('file', path)
 
-        outbase = auxnames[0][:-4]
+        if self.__is_biber():
+            outbase = os.path.join(cwd, outbase)
         outputs = [outbase + '.bbl', outbase + '.blg']
         return RunResult(outputs, {'outbase': outbase, 'status': status,
                                    'inputs': inputs})
@@ -1652,6 +1683,7 @@ class BibTeX(Task):
         kpathsea = Kpathsea('bibtex')
         inputs = []
         auxnames = []
+        outbase = None
         for line in log.splitlines():
             m = re.match('(?:The top-level auxiliary file:'
                          '|A level-[0-9]+ auxiliary file:) (.*)', line)
@@ -1677,7 +1709,21 @@ class BibTeX(Task):
 
                 inputs.append(filename)
 
-        return inputs, auxnames
+            # biber output
+            m = re.search("Found BibTeX data source '(.*?)'",
+                         line)
+            if m:
+                filename = m.group(1)
+                inputs.append(filename)
+
+            m = re.search("Logfile is '(.*?)'", line)
+            if m:
+                outbase = m.group(1)[:-4]
+
+        if outbase is None:
+            outbase = auxnames[0][:-4]
+
+        return inputs, auxnames, outbase
 
     def report(self):
         extra = self._get_result_extra()
@@ -1796,6 +1842,21 @@ class BibTeXFilter:
         if match('Aborted at line ([0-9]+) of file (.*)'):
             return ('info', m.group(2), int(m.group(1)), 'aborted')
 
+        # biber type errors
+        if match('^.*> WARN - (.*)$'):
+            print ('warning', None, None, m.group(1))
+            m2 = re.match("(.*) in file '(.*?)', skipping ...", m.group(1))
+            if m2:
+                return ('warning', m2.group(2), "0", m2.group(1))
+            return ('warning', None, None, m.group(1))
+
+        if match('^.*> ERROR - (.*)$'):
+            m2 = re.match("BibTeX subsystem: (.*?), line (\d+), (.*)$", m.group(1))
+            if m2:
+                return ('error', m2.group(1), m2.group(2), m2.group(3))
+            return ('error', None, None, m.group(1))
+
+
     def __canonicalize(self, msg):
         if msg.startswith('Warning'):
             msg = re.sub('^Warning-*', '', msg)
@@ -1889,6 +1950,151 @@ class Kpathsea:
         if cwd is None:
             return path
         return os.path.join(cwd, path)
+
+##################################################################
+# Glossary task
+#
+
+class Glossary(Task):
+    def __init__(self, db, latex_task, obj_dir):
+        super().__init__(db, 'glossary::' + normalize_input_path(
+            latex_task.get_tex_filename()))
+        self.__latex_task = latex_task
+        self.__obj_dir = obj_dir
+        self.__cmd = 'makeglossaries'
+        self.__cmd_args = ['-d', obj_dir]
+
+    def stable(self):
+        # If makeglossaries doesn't have its inputs, then it's stable because
+        # it has no effect on system state.
+        jobname = self.__latex_task.get_jobname()
+        if jobname is None:
+            # We don't know where the .aux file is until latex has run
+            return True
+        if not os.path.exists(jobname + '.aux'):
+            # Input isn't ready, so makeglossaries will simply fail
+            # without affecting system state. Hence, this task is
+            # trivially stable.
+            return True
+        if not self.__find_gls_cmds(os.path.dirname(jobname), jobname + '.aux'):
+            # The tex file doesn't refer to any bibliographic data, so
+            # don't run bibtex.
+            return True
+
+        return super().stable()
+
+    def __find_gls_cmds(self, basedir, auxname, stack=()):
+        debug('scanning for gls commands in {}'.format(auxname))
+        if auxname in stack:
+            raise TaskError('.aux file loop')
+        stack = stack + (auxname,)
+
+        try:
+            aux_data = open(auxname, errors='surrogateescape').read()
+        except FileNotFoundError:
+            # The aux file may not exist if latex aborted
+            debug("Could not read aux file - no gls files")
+            return False
+        if re.search(r'^\\\@newglossary\{', aux_data, flags=re.M) or \
+           re.search(r'^\\\@istfilename\{',  aux_data, flags=re.M):
+            debug("Found gls term")
+            return True
+
+        # Recurse into included aux files (see aux_input_command), in
+        # case \bibliography appears in an \included file.
+        for m in re.finditer(r'^\\@input\{([^}]*)\}', aux_data, flags=re.M):
+            if self.__find_gls_cmds(basedir, os.path.join(basedir, m.group(1)),
+                                    stack):
+                return True
+
+        debug("No gls terms found")
+        return False
+
+    def _input_args(self):
+        basename = os.path.basename(self.__latex_task.get_jobname())
+        return [self.__cmd] + self.__cmd_args + [basename]
+
+    def _input_cwd(self):
+        return os.path.dirname(self.__latex_task.get_jobname())
+
+    def __feed_terminal(self, stdout):
+        with Progress('glossary') as progress:
+            buf, linebuf = [], ''
+            while True:
+                data = os.read(stdout.fileno(), 4096)
+                if not data:
+                    break
+                # See "A note about encoding" above
+                data = data.decode('ascii', errors='surrogateescape')
+                buf.append(data)
+                linebuf += data
+                while '\n' in linebuf:
+                    line, _, linebuf = linebuf.partition('\n')
+                    debug(line)
+                    if line.startswith('Scanning '):
+                        filename = re.sub(r'^Scanning .* file (.*[^\.])\.*done .*$', r'\1', line)
+                        progress.update(self.__preppend_cwd(filename))
+        return ''.join(buf)
+
+    def __parse_filenames(self, stdout):
+        styname = inname = outname = None
+
+        # makeglossaries doesn't include the output directory in the
+        # logged transcript or output file name - hence __preppend_cwd()
+
+        for m in re.finditer(r'^xindy.*-o "([^"]+)"', stdout, re.MULTILINE | re.DOTALL):
+            outname = self.__preppend_cwd(m.group(1).replace('\n', ''))
+        for m in re.finditer(r'^xindy.* "([^"]+)"$', stdout, re.MULTILINE | re.DOTALL):
+            inname = self.__preppend_cwd(m.group(1).replace('\n', ''))
+
+        for m in re.finditer(r'^Scanning style file "?([^\n]*\.[^ ."]+)"?\.',
+                             stdout, re.MULTILINE | re.DOTALL):
+            styname = self.__preppend_cwd(m.group(1).replace('\n', ''))
+
+        for m in re.finditer(r'^Scanning input file "?([^\n]*\.[^ ."]+)"?\.',
+                             stdout, re.MULTILINE | re.DOTALL):
+            inname = self.__preppend_cwd(m.group(1).replace('\n', ''))
+        if inname is None:
+            raise TaskError('failed to extract input name from glossary output')
+
+        for m in re.finditer(r'^Output written in "?([^\n]*\.[^ ."\n]+)"?\.$',
+                             stdout, re.MULTILINE | re.DOTALL):
+            outname = self.__preppend_cwd(m.group(1).replace('\n', ''))
+        if outname is None:
+            raise TaskError('failed to extract output name from glossary output')
+
+        return styname, inname, outname
+
+    def __preppend_cwd(self, filepath):
+        if filepath.startswith('./'):
+            filepath = filepath[2:]
+        if os.path.basename(filepath) == filepath and \
+                os.path.exists(os.path.join(self.__obj_dir, filepath)):
+            filepath = os.path.join(self.__obj_dir, filepath)
+        return filepath
+
+    def _execute(self):
+        args = self._input('args')
+        debug('running {}', args)
+
+        try:
+            verbose_cmd(args)
+            p = subprocess.Popen(args, # cwd=cwd, env=env,
+                                 stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT)
+            stdout = self.__feed_terminal(p.stdout)
+            status = p.wait()
+        except OSError as e:
+            raise TaskError('failed to execute glossary task: ' + str(e)) from e
+
+        styname, inname, outname = self.__parse_filenames(stdout)
+
+        inputs = [inname]
+        if styname:
+            inputs.append(styname)
+        outputs = [outname]
+        return RunResult(outputs, {'status': status, 'inputs': inputs})
 
 if __name__ == "__main__":
     main()

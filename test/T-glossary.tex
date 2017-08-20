@@ -1,0 +1,24 @@
+\documentclass{article}
+
+\usepackage{hyperref}
+\usepackage{datatool}
+\usepackage{glossaries}
+
+\makeglossaries{}
+
+\newglossaryentry{glossary}{name=glossary,
+description={an alphabetical list of words relating to a specific subject, text, or dialect, with explanations}}
+
+\begin{document}
+
+This document features a \gls{glossary} made by \texttt{makeglossaries}.
+
+\newpage
+
+\printglossaries{}
+
+\end{document}
+
+%% status: 0
+
+%% output:
